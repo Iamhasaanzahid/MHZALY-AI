@@ -1,5 +1,6 @@
-# automation.py
 """
+automation.py
+
 EnterpriseAutomationEngine - improved, safer automation helper for MHZALY AI.
 
 Features:
@@ -10,10 +11,6 @@ Features:
 - screenshot, volume adjustment (best-effort), and safe call subsystem stub
 - gentle integration point with security.audit_log (if security.py exists)
 - confirmation guard rails via SAFE_MODE / ALLOWED_RECIPIENTS environment vars
-
-Notes:
-- This file intentionally avoids offensive capabilities.
-- To actually send SMS/calls, wire in Twilio or other provider with credentials and explicit consent.
 """
 from __future__ import annotations
 
@@ -22,7 +19,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import sys
 import time
 import urllib.parse
@@ -39,7 +35,7 @@ except Exception:
 try:
     from security import audit_log  # type: ignore
 except Exception:
-    def audit_log(event_type: str, details: Dict) -> None:  # no-op if security not present
+    def audit_log(event_type: str, details: Dict) -> None:
         return
 
 # Configuration
@@ -69,7 +65,6 @@ def _append_audit(entry: Dict) -> None:
     try:
         audit_log(entry.get("event", "audit"), entry_with_ts)
     except Exception:
-        # don't fail if audit_log hook not available or errors
         pass
 
 
@@ -117,7 +112,6 @@ class EnterpriseAutomationEngine:
             self.log_event("WARNING", "No target supplied to open_app_or_site")
             return "No target supplied."
 
-        # direct registry hit
         if normalized in self.global_platform_registry:
             url = self.global_platform_registry[normalized]["url"]
             try:
@@ -128,7 +122,6 @@ class EnterpriseAutomationEngine:
                 self.log_event("ERROR", f"Failed to open {normalized}: {e}")
                 return f"Failed to open {normalized}: {e}"
 
-        # fallback: do a Google search (safe)
         query = urllib.parse.quote_plus(target)
         search_url = f"https://www.google.com/search?q={query}"
         try:
@@ -140,24 +133,17 @@ class EnterpriseAutomationEngine:
             return f"Search failed: {e}"
 
     def open_site(self, name: str) -> None:
-        """Open site by name if known; otherwise perform search."""
         self.log_event("INFO", f"open_site called for {name}")
         self.open_app_or_site(name)
 
     # ----- WhatsApp helper -----
     def whatsapp_action(self, contact: str, action_type: str = "chat") -> str:
-        """
-        Open WhatsApp Web to chat or call a contact.
-        If contact looks like a phone number, attempt a web.whatsapp.com/send?phone= link.
-        This only opens the browser; it doesn't send messages programmatically.
-        """
+        """Open WhatsApp Web to chat or call a contact."""
         self.log_event("INFO", f"whatsapp_action: {action_type} -> {contact}")
 
-        # find phone number if present
         match = PHONE_RE.search(contact or "")
         if match:
             phone = re.sub(r"[^\d+]", "", match.group(1))
-            # WhatsApp deep link for web: https://web.whatsapp.com/send?phone=PHONENUMBER
             url = f"https://web.whatsapp.com/send?phone={urllib.parse.quote_plus(phone)}"
             try:
                 webbrowser.open(url)
@@ -167,7 +153,6 @@ class EnterpriseAutomationEngine:
                 self.log_event("ERROR", f"Failed to open WhatsApp Web: {e}")
                 return f"Failed to open WhatsApp Web: {e}"
 
-        # otherwise open base whatsapp site and instruct the user
         try:
             webbrowser.open(self.global_platform_registry.get("whatsapp", {}).get("url", "https://web.whatsapp.com"))
             return f"Opened WhatsApp Web. You can search for contact: {contact}"
@@ -213,10 +198,6 @@ class EnterpriseAutomationEngine:
 
     # ----- natural language parsing -----
     def advanced_natural_language_parser(self, raw_command_string: str) -> Dict:
-        """
-        Return dict:
-          { action: str, target: str, state: Optional[str], is_whatsapp: bool }
-        """
         if not raw_command_string or not isinstance(raw_command_string, str):
             self.log_event("WARNING", "advanced_natural_language_parser called with invalid input")
             return {"action": "none", "target": "", "state": None, "is_whatsapp": False}
@@ -248,7 +229,6 @@ class EnterpriseAutomationEngine:
         # token cleanup
         raw_tokens = re.split(r"\s+|[,.;:]", normalized)
         filtered = [t for t in raw_tokens if t and t not in self.noise_vocabulary]
-        # remove control words we handled
         control_words = {"call", "whatsapp", "phone", "volume", "screen", "security", "log", "screenshot"}
         filtered = [t for t in filtered if t not in control_words]
         target = " ".join(filtered).strip().title()
@@ -261,35 +241,23 @@ class EnterpriseAutomationEngine:
 
     # ----- call subsystem (safe stub) -----
     def execute_call_subsystem(self, target: str, is_whatsapp: bool = False, state: Optional[str] = None) -> str:
-        """
-        Attempt to open the appropriate channel to call/contact the target.
-        This is a safe stub: it will open the appropriate web UI or request confirmation
-        rather than placing calls itself.
-        """
         self.log_event("INFO", f"execute_call_subsystem target='{target}', is_whatsapp={is_whatsapp}, state={state}")
 
-        # simple phone extraction
         match = PHONE_RE.search(target or "")
         if is_whatsapp or match:
             return self.whatsapp_action(target, action_type="call" if match else "chat")
 
-        # if target is a known registry entry, open it
         key = (target or "").strip().lower()
         if key in self.global_platform_registry:
             self.open_site(key)
             return f"Opened {key} UI to contact {target}."
 
-        # fallback: suggest the user or perform a search
         msg = f"Could not determine call channel for '{target}'. I opened a web search to help."
         self.open_app_or_site(target)
         return msg
 
     # ----- security/log analysis integration -----
     def analyze_security_log(self, path: str = "security_log.jsonl") -> Dict:
-        """
-        Lightweight analysis: count lines, look for 'error' or 'secret' keywords.
-        Do NOT send logs externally.
-        """
         self.log_event("INFO", f"Analyzing security log: {path}")
         if not os.path.exists(path):
             return {"found": False, "reason": "log_not_found"}
@@ -326,8 +294,8 @@ class EnterpriseAutomationEngine:
             return json.dumps(self.analyze_security_log(), indent=2)
         return f"Action '{action}' not implemented. Parsed: {parsed}"
 
+
 if __name__ == "__main__":
-    # quick demo when run directly
     engine = EnterpriseAutomationEngine()
     print(engine.open_app_or_site("github"))
     print(engine.whatsapp_action("+1 555 123 4567"))
