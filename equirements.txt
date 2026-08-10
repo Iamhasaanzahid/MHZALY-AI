@@ -1,0 +1,9 @@
+streamlit
+pyautogui
+edge-tts
+pygame
+SpeechRecognition
+google-genai
+cryptography
+twilio
+requests
