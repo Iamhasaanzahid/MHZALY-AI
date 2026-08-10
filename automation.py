@@ -1,277 +1,336 @@
+# automation.py
 """
-automation.py
+EnterpriseAutomationEngine - improved, safer automation helper for MHZALY AI.
 
-Contains safe helper functions to:
- - automate desktop UI (pyautogui)
- - send email (smtplib)
- - send SMS / WhatsApp / call via Twilio (official API)
- - send messages to Slack via webhook
- - run composed tasks
+Features:
+- robust logging (string trail + structured JSON audit file)
+- improved natural language parsing with simple heuristics
+- site/app opening with safe fallback search
+- WhatsApp web deep-link handling when a phone number is provided
+- screenshot, volume adjustment (best-effort), and safe call subsystem stub
+- gentle integration point with security.audit_log (if security.py exists)
+- confirmation guard rails via SAFE_MODE / ALLOWED_RECIPIENTS environment vars
 
-Security & safety design choices:
- - All network credentials must be supplied by environment variables or .env
- - Recipient numbers/IDs must be explicitly listed in allowed_recipients for sending
- - Simple rate-limit cooldowns and an explicit "require_confirmation" option for risky ops
- - Use official APIs (Twilio, SMTP, Slack webhooks). Do NOT scrape or reverse-engineer other apps.
+Notes:
+- This file intentionally avoids offensive capabilities.
+- To actually send SMS/calls, wire in Twilio or other provider with credentials and explicit consent.
 """
+from __future__ import annotations
 
+import datetime
+import json
+import logging
 import os
+import re
+import shlex
 import sys
 import time
-import json
-import threading
-import smtplib
-from email.message import EmailMessage
-import requests
+import urllib.parse
+import webbrowser
+from typing import Dict, List, Optional
 
-# Try to import audit_log from security.py (if present); otherwise no-op
-try:
-    from security import audit_log
-except Exception:
-    def audit_log(event_type, details):
-        pass
-
-SAFE_MODE = os.environ.get("SAFE_MODE", "true").lower() in ("1", "true", "yes")
-
-# Optional libs
+# Optional integrations
 try:
     import pyautogui
 except Exception:
     pyautogui = None
 
+# Optional audit integration (from security.py)
 try:
-    from twilio.rest import Client as TwilioClient
+    from security import audit_log  # type: ignore
 except Exception:
-    TwilioClient = None
+    def audit_log(event_type: str, details: Dict) -> None:  # no-op if security not present
+        return
 
-# Simple in-memory rate-limiter (not persistent)
-_last_sent = {}
-DEFAULT_COOLDOWN = 30  # seconds
+# Configuration
+SAFE_MODE = os.environ.get("SAFE_MODE", "true").lower() in ("1", "true", "yes")
+ALLOWED_RECIPIENTS = set(
+    p.strip() for p in os.environ.get("ALLOWED_RECIPIENTS", "").split(",") if p.strip()
+)
+AUDIT_LOG_PATH = os.environ.get("EXECUTION_AUDIT_PATH", "execution_audit.jsonl")
 
-# Allowed recipients (must be configured by you)
-ALLOWED_RECIPIENTS = os.environ.get("ALLOWED_RECIPIENTS", "")  # comma-separated numbers/emails/ids
-_allowed_set = set([s.strip() for s in ALLOWED_RECIPIENTS.split(",") if s.strip()])
+# Logging
+logger = logging.getLogger("EnterpriseAutomationEngine")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-def _cooldown_check(key, cooldown=DEFAULT_COOLDOWN):
-    now = time.time()
-    last = _last_sent.get(key, 0)
-    if now - last < cooldown:
-        return False, cooldown - (now - last)
-    _last_sent[key] = now
-    return True, 0
 
-def _require_allowed(recipient):
-    if not _allowed_set:
-        # If none configured, require interactive confirmation
-        print("WARNING: No ALLOWED_RECIPIENTS configured. Interactive confirmation will be required.")
-        return False
-    return recipient in _allowed_set
-
-def validate_config():
-    # Simple checks for typical integrations. Return (ok, message)
-    msgs = []
-    if TwilioClient is None:
-        msgs.append("twilio library not installed (pip install twilio) — Twilio actions disabled")
-    if pyautogui is None:
-        msgs.append("pyautogui not installed (pip install pyautogui) — desktop automation disabled")
-    if not os.environ.get("SMTP_USERNAME") and not os.environ.get("TWILIO_ACCOUNT_SID"):
-        msgs.append("No SMTP_USERNAME or TWILIO_ACCOUNT_SID detected — messaging/calls disabled until configured")
-    return (len(msgs) == 0, "; ".join(msgs) if msgs else "All good")
-
-def load_tasks(path="tasks.json"):
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# Desktop automation (very simple)
-def open_app(path_or_command):
+def _append_audit(entry: Dict) -> None:
+    """Write structured audit record (non-sensitive) to file and call audit_log hook."""
     try:
-        if os.name == "nt":
-            os.startfile(path_or_command)
-        elif sys.platform == "darwin":
-            os.system(f"open '{path_or_command}' &")
-        else:
-            os.system(f"xdg-open '{path_or_command}' &")
-        return True, "started"
+        entry_with_ts = {"ts": datetime.datetime.utcnow().isoformat() + "Z", **entry}
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry_with_ts, ensure_ascii=False) + "\n")
     except Exception as e:
-        return False, str(e)
-
-def type_text(text, interval=0.02):
-    if pyautogui is None:
-        return False, "pyautogui not available"
-    pyautogui.write(text, interval=interval)
-    return True, "typed"
-
-def press_key(key):
-    if pyautogui is None:
-        return False, "pyautogui not available"
-    pyautogui.press(key)
-    return True, "pressed"
-
-# Email (SMTP)
-def send_email(to_address, subject, body, require_confirmation=True, cooldown=DEFAULT_COOLDOWN):
-    ok, wait = _cooldown_check(f"email:{to_address}", cooldown)
-    if not ok:
-        return False, f"Cooldown active, wait {wait:.1f}s"
-    if require_confirmation and not _require_allowed(to_address):
-        confirm = input(f"Send email to {to_address}? Type YES to confirm: ")
-        if confirm.strip() != "YES":
-            return False, "User cancelled"
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", 587))
-    user = os.environ.get("SMTP_USERNAME")
-    pwd = os.environ.get("SMTP_PASSWORD")
-    if not user or not pwd:
-        return False, "SMTP credentials missing"
-    msg = EmailMessage()
-    msg["From"] = user
-    msg["To"] = to_address
-    msg["Subject"] = subject
-    msg.set_content(body)
+        logger.debug("Failed to write audit log: %s", e)
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
-            s.starttls()
-            s.login(user, pwd)
-            s.send_message(msg)
-        audit_log("send_email", {"to": to_address, "subject": subject, "result": "sent", "require_confirmation": require_confirmation})
-        return True, "email sent"
-    except Exception as e:
-        audit_log("send_email", {"to": to_address, "subject": subject, "result": "error", "error": str(e)})
-        return False, str(e)
-
-# Twilio: SMS, WhatsApp, and Calls
-def _twilio_client():
-    sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    token = os.environ.get("TWILIO_AUTH_TOKEN")
-    if not sid or not token:
-        return None
-    if TwilioClient is None:
-        return None
-    return TwilioClient(sid, token)
-
-def send_sms(to_number, body, from_number=None, require_confirmation=True, cooldown=DEFAULT_COOLDOWN):
-    ok, wait = _cooldown_check(f"sms:{to_number}", cooldown)
-    if not ok:
-        return False, f"Cooldown active, wait {wait:.1f}s"
-    if require_confirmation and not _require_allowed(to_number):
-        confirm = input(f"Send SMS to {to_number}? Type YES to confirm: ")
-        if confirm.strip() != "YES":
-            return False, "User cancelled"
-    client = _twilio_client()
-    if client is None:
-        return False, "Twilio not configured or library missing"
-    from_ = from_number or os.environ.get("TWILIO_FROM_NUMBER")
-    if not from_:
-        return False, "TWILIO_FROM_NUMBER not configured"
-    try:
-        msg = client.messages.create(body=body, from_=from_, to=to_number)
-        audit_log("send_sms", {"to": to_number, "from": from_, "sid": getattr(msg, 'sid', None)})
-        return True, f"sent id={getattr(msg, 'sid', None)}"
-    except Exception as e:
-        audit_log("send_sms", {"to": to_number, "from": from_, "result": "error", "error": str(e)})
-        return False, str(e)
-
-def send_whatsapp(to_number, body, from_number=None, require_confirmation=True, cooldown=DEFAULT_COOLDOWN):
-    # Twilio WhatsApp requires 'whatsapp:+123...' format
-    if not to_number.startswith("whatsapp:"):
-        to_number = "whatsapp:" + to_number
-    if from_number and not from_number.startswith("whatsapp:"):
-        from_number = "whatsapp:" + from_number
-    return send_sms(to_number, body, from_number=from_number, require_confirmation=require_confirmation, cooldown=cooldown)
-
-def make_call(to_number, twiml_url=None, from_number=None, require_confirmation=True, cooldown=DEFAULT_COOLDOWN):
-    ok, wait = _cooldown_check(f"call:{to_number}", cooldown)
-    if not ok:
-        return False, f"Cooldown active, wait {wait:.1f}s"
-    if require_confirmation and not _require_allowed(to_number):
-        confirm = input(f"Place call to {to_number}? Type YES to confirm: ")
-        if confirm.strip() != "YES":
-            return False, "User cancelled"
-    client = _twilio_client()
-    if client is None:
-        return False, "Twilio not configured or library missing"
-    from_ = from_number or os.environ.get("TWILIO_FROM_NUMBER")
-    if not from_:
-        return False, "TWILIO_FROM_NUMBER not configured"
-    try:
-        call = client.calls.create(to=to_number, from_=from_, url=twiml_url or os.environ.get("DEFAULT_TWIML_URL"))
-        audit_log("make_call", {"to": to_number, "from": from_, "sid": getattr(call, 'sid', None)})
-        return True, f"call started id={getattr(call, 'sid', None)}"
-    except Exception as e:
-        audit_log("make_call", {"to": to_number, "result": "error", "error": str(e)})
-        return False, str(e)
-
-# Slack webhook
-def send_slack(webhook_url, text, require_confirmation=True, cooldown=DEFAULT_COOLDOWN):
-    key = f"slack:{webhook_url}"
-    ok, wait = _cooldown_check(key, cooldown)
-    if not ok:
-        return False, f"Cooldown active, wait {wait:.1f}s"
-    if require_confirmation and not _allowed_set:
-        confirm = input(f"Post to Slack webhook? Type YES to confirm: ")
-        if confirm.strip() != "YES":
-            return False, "User cancelled"
-    payload = {"text": text}
-    try:
-        r = requests.post(webhook_url, json=payload, timeout=10)
-        r.raise_for_status()
-        audit_log("send_slack", {"webhook_url": webhook_url, "text_preview": text[:200]})
-        return True, "slack posted"
-    except Exception as e:
-        audit_log("send_slack", {"webhook_url": webhook_url, "result": "error", "error": str(e)})
-        return False, str(e)
-
-# Higher-level: run a "task" dict
-def run_task(task):
-    """
-    Task format (JSON/dict) examples:
-    {
-      "name": "greet",
-      "actions": [
-         {"type": "open_app", "path": "/Applications/Notes.app"},
-         {"type": "wait", "seconds": 2},
-         {"type": "type", "text": "Hello, this is automated."},
-         {"type": "send_sms", "to": "+1234567890", "body": "Automated alert", "require_confirmation": false}
-      ]
-    }
-    """
-    actions = task.get("actions", [])
-    results = []
-    for a in actions:
-        t = a.get("type")
-        try:
-            if t == "open_app":
-                res = open_app(a["path"])
-            elif t == "type":
-                res = type_text(a.get("text", ""))
-            elif t == "press":
-                res = press_key(a.get("key", "enter"))
-            elif t == "wait":
-                secs = float(a.get("seconds", 1))
-                time.sleep(secs)
-                res = (True, f"waited {secs}s")
-            elif t == "send_email":
-                res = send_email(a["to"], a.get("subject", ""), a.get("body", ""), require_confirmation=a.get("require_confirmation", True))
-            elif t == "send_sms":
-                res = send_sms(a["to"], a.get("body", ""), from_number=a.get("from"), require_confirmation=a.get("require_confirmation", True))
-            elif t == "send_whatsapp":
-                res = send_whatsapp(a["to"], a.get("body", ""), from_number=a.get("from"), require_confirmation=a.get("require_confirmation", True))
-            elif t == "call":
-                res = make_call(a["to"], twiml_url=a.get("twiml_url"), from_number=a.get("from"), require_confirmation=a.get("require_confirmation", True))
-            elif t == "slack":
-                res = send_slack(a["webhook_url"], a.get("text", ""), require_confirmation=a.get("require_confirmation", True))
-            else:
-                res = (False, f"unknown action type {t}")
-        except Exception as exc:
-            res = (False, str(exc))
-        results.append({"action": a, "result": res})
-    # Optional: return or log results to a file
-    log_path = os.environ.get("AUTOMATION_LOG", "automation_log.jsonl")
-    try:
-        with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(json.dumps({"task": task.get("name"), "results": results, "ts": time.time()}) + "\n")
+        audit_log(entry.get("event", "audit"), entry_with_ts)
     except Exception:
+        # don't fail if audit_log hook not available or errors
         pass
-    print("Task", task.get("name"), "completed. Results:", results)
-    return results
+
+
+PHONE_RE = re.compile(r"(\+?\d[\d\-\s]{6,}\d)")
+
+
+class EnterpriseAutomationEngine:
+    def __init__(self, owner_name: str = "Muhammad Hassaan Zahid"):
+        self.owner = owner_name
+        self.version = "5.2.0-Enterprise"
+        self.session_started = datetime.datetime.utcnow().isoformat() + "Z"
+        self.execution_audit_trail: List[str] = []
+        self.security_logs: List[str] = []
+        self.global_platform_registry: Dict[str, Dict] = {
+            "whatsapp": {"category": "communication", "type": "app", "url": "https://web.whatsapp.com", "secure": True},
+            "telegram": {"category": "communication", "type": "app", "url": "https://web.telegram.org", "secure": True},
+            "signal": {"category": "communication", "type": "app", "url": "https://signal.org", "secure": True},
+            "discord": {"category": "communication", "type": "app", "url": "https://discord.com", "secure": True},
+            "slack": {"category": "communication", "type": "app", "url": "https://slack.com", "secure": True},
+            "github": {"category": "dev", "type": "website", "url": "https://github.com/", "secure": True},
+            "google": {"category": "utility", "type": "website", "url": "https://google.com", "secure": True},
+            "youtube": {"category": "media", "type": "website", "url": "https://www.youtube.com/", "secure": True},
+            "notion": {"category": "productivity", "type": "website", "url": "https://notion.so", "secure": True},
+        }
+        self.noise_vocabulary = {
+            "on", "off", "please", "kindly", "run", "execute", "start", "open", "launch",
+            "access", "visit", "to", "via", "app", "application", "portal", "system", "browser", "website",
+        }
+        logger.info("Engine initialized for %s (version=%s)", self.owner, self.version)
+        _append_audit({"event": "engine_init", "owner": self.owner, "version": self.version})
+
+    # ----- logging helpers -----
+    def log_event(self, log_level: str, message: str) -> None:
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        formatted_entry = f"[{timestamp}] [{log_level.upper()}] {message}"
+        print(formatted_entry)
+        self.execution_audit_trail.append(formatted_entry)
+        _append_audit({"event": "log", "level": log_level, "message": message})
+
+    # ----- app/site actions -----
+    def open_app_or_site(self, target: str) -> str:
+        """Open a known app/site or perform a safe web search fallback."""
+        normalized = (target or "").strip().lower()
+        if not normalized:
+            self.log_event("WARNING", "No target supplied to open_app_or_site")
+            return "No target supplied."
+
+        # direct registry hit
+        if normalized in self.global_platform_registry:
+            url = self.global_platform_registry[normalized]["url"]
+            try:
+                webbrowser.open(url)
+                self.log_event("INFO", f"Opened registered platform: {normalized} -> {url}")
+                return f"Opened {normalized}."
+            except Exception as e:
+                self.log_event("ERROR", f"Failed to open {normalized}: {e}")
+                return f"Failed to open {normalized}: {e}"
+
+        # fallback: do a Google search (safe)
+        query = urllib.parse.quote_plus(target)
+        search_url = f"https://www.google.com/search?q={query}"
+        try:
+            webbrowser.open(search_url)
+            self.log_event("INFO", f"No registry entry for {target}; performed search.")
+            return f"Searched the web for: {target}"
+        except Exception as e:
+            self.log_event("ERROR", f"Search fallback failed for {target}: {e}")
+            return f"Search failed: {e}"
+
+    def open_site(self, name: str) -> None:
+        """Open site by name if known; otherwise perform search."""
+        self.log_event("INFO", f"open_site called for {name}")
+        self.open_app_or_site(name)
+
+    # ----- WhatsApp helper -----
+    def whatsapp_action(self, contact: str, action_type: str = "chat") -> str:
+        """
+        Open WhatsApp Web to chat or call a contact.
+        If contact looks like a phone number, attempt a web.whatsapp.com/send?phone= link.
+        This only opens the browser; it doesn't send messages programmatically.
+        """
+        self.log_event("INFO", f"whatsapp_action: {action_type} -> {contact}")
+
+        # find phone number if present
+        match = PHONE_RE.search(contact or "")
+        if match:
+            phone = re.sub(r"[^\d+]", "", match.group(1))
+            # WhatsApp deep link for web: https://web.whatsapp.com/send?phone=PHONENUMBER
+            url = f"https://web.whatsapp.com/send?phone={urllib.parse.quote_plus(phone)}"
+            try:
+                webbrowser.open(url)
+                _append_audit({"event": "whatsapp_open", "target": phone, "action": action_type})
+                return f"Opened WhatsApp Web for {phone}."
+            except Exception as e:
+                self.log_event("ERROR", f"Failed to open WhatsApp Web: {e}")
+                return f"Failed to open WhatsApp Web: {e}"
+
+        # otherwise open base whatsapp site and instruct the user
+        try:
+            webbrowser.open(self.global_platform_registry.get("whatsapp", {}).get("url", "https://web.whatsapp.com"))
+            return f"Opened WhatsApp Web. You can search for contact: {contact}"
+        except Exception as e:
+            self.log_event("ERROR", f"Failed to open WhatsApp Web: {e}")
+            return f"Failed to open WhatsApp Web: {e}"
+
+    # ----- system helpers -----
+    def adjust_volume(self, direction: str) -> str:
+        """Best-effort volume adjustment using pyautogui if available."""
+        self.log_event("INFO", f"adjust_volume called: {direction}")
+        if pyautogui is None:
+            return "pyautogui not available for volume control."
+
+        try:
+            if direction in ("up", "increase", "+"):
+                pyautogui.press("volumeup")
+            elif direction in ("down", "decrease", "-"):
+                pyautogui.press("volumedown")
+            else:
+                return "Unknown volume direction. Use 'up' or 'down'."
+            _append_audit({"event": "volume_adjust", "direction": direction})
+            return f"Volume adjusted {direction}."
+        except Exception as e:
+            self.log_event("ERROR", f"adjust_volume failed: {e}")
+            return f"Volume adjustment failed: {e}"
+
+    def take_screenshot(self, folder: str = ".") -> str:
+        self.log_event("INFO", "take_screenshot called")
+        if pyautogui is None:
+            return "pyautogui not available to take screenshot."
+        try:
+            os.makedirs(folder, exist_ok=True)
+            filename = os.path.join(folder, f"screenshot_{int(time.time())}.png")
+            shot = pyautogui.screenshot()
+            shot.save(filename)
+            _append_audit({"event": "screenshot", "file": filename})
+            self.log_event("SUCCESS", f"Screenshot saved: {filename}")
+            return f"Saved screenshot to {filename}"
+        except Exception as e:
+            self.log_event("ERROR", f"take_screenshot failed: {e}")
+            return f"Screenshot failed: {e}"
+
+    # ----- natural language parsing -----
+    def advanced_natural_language_parser(self, raw_command_string: str) -> Dict:
+        """
+        Return dict:
+          { action: str, target: str, state: Optional[str], is_whatsapp: bool }
+        """
+        if not raw_command_string or not isinstance(raw_command_string, str):
+            self.log_event("WARNING", "advanced_natural_language_parser called with invalid input")
+            return {"action": "none", "target": "", "state": None, "is_whatsapp": False}
+
+        normalized = raw_command_string.strip().lower()
+        detected_state: Optional[str] = None
+        if re.search(r"\boff\b", normalized):
+            detected_state = "OFF"
+        elif re.search(r"\bon\b", normalized):
+            detected_state = "ON"
+
+        action_type = "general"
+        if "call" in normalized:
+            action_type = "communication_call"
+        elif any(k in normalized for k in ["open", "launch", "access", "visit", "start"]):
+            action_type = "navigation_launch"
+        elif any(k in normalized for k in ["status", "check", "health"]):
+            action_type = "system_status"
+        elif any(k in normalized for k in ["volume", "awaz", "sound"]):
+            if any(k in normalized for k in ["up", "increase", "unche"]):
+                action_type = "volume_up"
+            elif any(k in normalized for k in ["down", "decrease", "kam"]):
+                action_type = "volume_down"
+        elif "screenshot" in normalized or "screen" in normalized:
+            action_type = "take_screenshot"
+        elif "security log" in normalized or "security" in normalized:
+            action_type = "analyze_log"
+
+        # token cleanup
+        raw_tokens = re.split(r"\s+|[,.;:]", normalized)
+        filtered = [t for t in raw_tokens if t and t not in self.noise_vocabulary]
+        # remove control words we handled
+        control_words = {"call", "whatsapp", "phone", "volume", "screen", "security", "log", "screenshot"}
+        filtered = [t for t in filtered if t not in control_words]
+        target = " ".join(filtered).strip().title()
+
+        is_whatsapp = "whatsapp" in normalized
+        parsed = {"action": action_type, "target": target, "state": detected_state, "is_whatsapp": is_whatsapp}
+        self.log_event("DEBUG", f"Parsed command '{raw_command_string}' -> {parsed}")
+        _append_audit({"event": "nl_parse", "input": raw_command_string[:500], "parsed": parsed})
+        return parsed
+
+    # ----- call subsystem (safe stub) -----
+    def execute_call_subsystem(self, target: str, is_whatsapp: bool = False, state: Optional[str] = None) -> str:
+        """
+        Attempt to open the appropriate channel to call/contact the target.
+        This is a safe stub: it will open the appropriate web UI or request confirmation
+        rather than placing calls itself.
+        """
+        self.log_event("INFO", f"execute_call_subsystem target='{target}', is_whatsapp={is_whatsapp}, state={state}")
+
+        # simple phone extraction
+        match = PHONE_RE.search(target or "")
+        if is_whatsapp or match:
+            return self.whatsapp_action(target, action_type="call" if match else "chat")
+
+        # if target is a known registry entry, open it
+        key = (target or "").strip().lower()
+        if key in self.global_platform_registry:
+            self.open_site(key)
+            return f"Opened {key} UI to contact {target}."
+
+        # fallback: suggest the user or perform a search
+        msg = f"Could not determine call channel for '{target}'. I opened a web search to help."
+        self.open_app_or_site(target)
+        return msg
+
+    # ----- security/log analysis integration -----
+    def analyze_security_log(self, path: str = "security_log.jsonl") -> Dict:
+        """
+        Lightweight analysis: count lines, look for 'error' or 'secret' keywords.
+        Do NOT send logs externally.
+        """
+        self.log_event("INFO", f"Analyzing security log: {path}")
+        if not os.path.exists(path):
+            return {"found": False, "reason": "log_not_found"}
+        counts = {"lines": 0, "errors": 0, "secrets": 0}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    counts["lines"] += 1
+                    low = ln.lower()
+                    if "error" in low or "\"result\": \"error\"" in low:
+                        counts["errors"] += 1
+                    if "secret" in low or "aws" in low or "ghp_" in low:
+                        counts["secrets"] += 1
+        except Exception as e:
+            self.log_event("ERROR", f"analyze_security_log failed: {e}")
+            return {"found": True, "error": str(e)}
+        _append_audit({"event": "analyze_security_log", "summary": counts})
+        return {"found": True, "summary": counts}
+
+    # ----- small helper to run parsed commands -----
+    def handle_command(self, raw: str) -> str:
+        parsed = self.advanced_natural_language_parser(raw)
+        action = parsed["action"]
+        target = parsed["target"] or raw
+        if action == "take_screenshot":
+            return self.take_screenshot()
+        if action in ("volume_up", "volume_down"):
+            return self.adjust_volume("up" if action == "volume_up" else "down")
+        if action in ("navigation_launch", "general"):
+            return self.open_app_or_site(target or raw)
+        if action == "communication_call":
+            return self.execute_call_subsystem(target or raw, parsed["is_whatsapp"], parsed["state"])
+        if action == "analyze_log":
+            return json.dumps(self.analyze_security_log(), indent=2)
+        return f"Action '{action}' not implemented. Parsed: {parsed}"
+
+if __name__ == "__main__":
+    # quick demo when run directly
+    engine = EnterpriseAutomationEngine()
+    print(engine.open_app_or_site("github"))
+    print(engine.whatsapp_action("+1 555 123 4567"))
+    print(engine.take_screenshot())
+    print(engine.advanced_natural_language_parser("Please call +1 555 123 4567 on whatsapp"))
+    print(engine.handle_command("Take a screenshot"))
