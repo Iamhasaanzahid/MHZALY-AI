@@ -2,13 +2,27 @@ import streamlit as st
 import time
 import os
 import threading
+import logging
 
 from automation import EnterpriseAutomationEngine
-import voice_engine
+# Safe import for voice engine so the UI doesn't crash if module is missing
+try:
+    import voice_engine
+    voice_engine_available = True
+    voice_import_error = None
+except (ImportError, ModuleNotFoundError) as e:
+    voice_engine = None
+    voice_engine_available = False
+    voice_import_error = e
+    logging.exception("voice_engine import failed")
 
 automation = EnterpriseAutomationEngine()
 
 st.set_page_config(page_title="MHZALY AI - Next-Gen System", layout="wide", page_icon="🤖")
+
+# Show a warning in the UI if voice engine failed to import
+if not voice_engine_available:
+    st.warning("Voice features are unavailable on this environment — check logs for details.")
 
 st.markdown("""
 <style>
@@ -68,6 +82,12 @@ with col3:
     def do_listen_and_handle():
         st.session_state["listening"] = True
         try:
+            # If voice engine is not available, set a clear result and avoid raising
+            if voice_engine is None:
+                st.session_state["last_recognized"] = None
+                st.session_state["last_result"] = "Voice engine unavailable."
+                return
+
             txt = voice_engine.listen_user()
             if txt:
                 st.session_state["last_recognized"] = txt
