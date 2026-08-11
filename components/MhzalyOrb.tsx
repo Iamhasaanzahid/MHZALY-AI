@@ -37,18 +37,18 @@ export default function MhzalyOrb() {
     };
   }, []);
 
-  const executeMhzalyTask = (taskType: string) => {
-    if (taskType === "whatsapp") {
-      setTaskStatus("WHATSAPP INTENT DISPATCHED");
-      window.open("https://wa.me/?text=M.H.Z.A.L.Y.%20Autonomous%20Command%20Active", "_blank");
-    } else if (taskType === "speech") {
-      setTaskStatus("AUDIO SYNTHESIS ACTIVE");
-      const utterance = new SpeechSynthesisUtterance("M.H.Z.A.L.Y. intelligence online. Systems fully operational.");
-      utterance.pitch = 0.8;
-      window.speechSynthesis.speak(utterance);
-    }
-  };
-
+  } else if (taskType === 'speech') {
+    setTaskStatus("AUDIO SYNTHESIS ACTIVE");
+    fetch('http://localhost:5000/speak', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+            text: "M.H.Z.A.L.Y. intelligence online. Systems fully operational." 
+        }),
+    });
+}
   const stopGestures = useCallback(() => {
     trackerRef.current?.stop();
     trackerRef.current = null;
