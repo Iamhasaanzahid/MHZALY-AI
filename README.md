@@ -1,46 +1,27 @@
-# MHZALY-AI-Assistant
+## Optional voice dependencies
 
-A voice-enabled AI assistant (MHZALY) with desktop automation, messaging helpers, vision analysis, and safety-focused security tooling.
+The voice features (microphone listening and Edge TTS) are optional and require native or external dependencies (e.g., SpeechRecognition, PyAudio/system microphone drivers, edge_tts, pygame).
 
-Features
-- Voice interaction using a microphone (SpeechRecognition + Edge TTS).
-- Multi-language support (Urdu, English, Spanish, Arabic, French, German, Chinese).
-- Desktop automation (open apps/sites, screenshots, volume control).
-- WhatsApp web deep-link helper and safe call stub.
-- Vision helper (screenshot -> Gemini/genai API) — optional and requires API credentials.
-- Security helpers: secret scanning, pip-audit/bandit integration, structured audit logs.
-- GitHub Actions workflow to run pip-audit & bandit on pushes/PRs.
+If you run Streamlit in an environment without a microphone or the optional packages installed, the UI will show a warning and the voice microphone button will be disabled (no crash).
 
-Quick setup (local)
-1. Clone:
-   git clone https://github.com/Iamhasaanzahid/MHZALY-AI-Assistant.git
-   cd MHZALY-AI-Assistant
+To enable voice features locally:
 
-2. Create a virtualenv and install dependencies:
+1. Create and activate a virtual environment:
+   ```bash
    python -m venv .venv
    source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   ```
+2. Install requirements:
+   ```bash
    pip install -r requirements.txt
+   ```
+3. (Optional) If you use PyAudio on Windows, follow instructions to install the appropriate wheel for your Python version.
 
-3. Add credentials via environment variables or a .env file (do NOT commit .env):
-   - For TTS (Edge) and SR you may not need API keys; for genai/Gemini you need your provider's key.
-   - Example: SAFE_MODE=true ALLOWED_RECIPIENTS="+1234567890"
+Running voice tests locally (optional):
 
-4. Run the Streamlit UI:
-   streamlit run app.py
+The repository includes an optional smoke test that is skipped by default. To run it set the environment variable RUN_VOICE_TESTS=1 and run pytest:
 
-Notes & security
-- SAFE_MODE defaults to true. Keep it true while testing to require interactive confirmations.
-- Do not store secrets in the repo. Use environment variables or a secrets manager.
-- CI: a GitHub Actions workflow runs pip-audit and bandit to surface vulnerable dependencies and common insecure patterns.
-
-Testing
-- Run a quick automation test:
-  python -c "from automation import EnterpriseAutomationEngine; e=EnterpriseAutomationEngine(); print(e.handle_command('open github'))"
-- Voice test (requires microphone):
-  python -c "import voice_engine; print(voice_engine.listen_user())"
-
-Contributing
-- Create a feature branch, run tests locally, open a pull request. Security fixes or dependency updates are welcome.
-
-License
-- Add license file as appropriate.
+```bash
+export RUN_VOICE_TESTS=1
+pytest tests/test_voice_optional.py
+```
