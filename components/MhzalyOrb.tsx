@@ -24,6 +24,10 @@ export default function MhzalyOrb() {
   const [error, setError] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<string>("READY");
 
+  // Voice recognition UI state
+  const [listening, setListening] = useState<boolean>(false);
+  const [lastTranscript, setLastTranscript] = useState<string | null>(null);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -37,63 +41,148 @@ export default function MhzalyOrb() {
     };
   }, []);
 
-  // Handle tasks invoked from the HUD buttons
-  const executeMhzalyTask = useCallback(async (taskType: "whatsapp" | "speech") => {
+  // Speak helper that uses /api/speak proxy then falls back to Web Speech
+  const speakText = useCallback(async (text: string) => {
+    setTaskStatus("AUDIO SYNTHESIS ACTIVE");
     try {
-      if (taskType === "whatsapp") {
-        setTaskStatus("OPENING WHATSAPP");
-        // Open WhatsApp Web in a new tab
-        if (typeof window !== "undefined") window.open("https://web.whatsapp.com", "_blank");
-        // return to READY after a short delay
-        setTimeout(() => setTaskStatus("READY"), 1200);
+      const res = await fetch('/api/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!res.ok) throw new Error(`speak proxy failed ${res.status}`);
+
+      setTaskStatus('READY');
+      return;
+    } catch (proxyErr) {
+      console.warn('speak proxy failed, falling back to client TTS:', proxyErr);
+    }
+
+    // Fallback to browser TTS
+    try {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = 'en-US';
+        utter.onend = () => setTaskStatus('READY');
+        utter.onerror = (e) => {
+          console.error('speechSynthesis error', e);
+          setTaskStatus('SPEECH ERROR');
+        };
+        window.speechSynthesis.speak(utter);
         return;
       }
+    } catch (ttsErr) {
+      console.error('Web Speech API error:', ttsErr);
+    }
 
-      if (taskType === "speech") {
-        const textToSpeak = "M.H.Z.A.L.Y. intelligence online. Systems fully operational.";
-        setTaskStatus("AUDIO SYNTHESIS ACTIVE");
+    setTaskStatus('SPEECH UNAVAILABLE');
+  }, []);
 
-        // First try server-backed speak proxy (avoids CORS/mixed-content issues)
-        try {
-          const res = await fetch('/api/speak', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: textToSpeak }),
-          });
-
-          if (!res.ok) throw new Error(`speak proxy failed: ${res.status}`);
-
-          // If backend returns audio or text, we consider it successful.
-          setTaskStatus('READY');
+  // Handle tasks invoked from the HUD buttons or voice commands
+  const executeMhzalyTask = useCallback(
+    async (taskType: "whatsapp" | "speech", payloadText?: string) => {
+      try {
+        if (taskType === "whatsapp") {
+          setTaskStatus("OPENING WHATSAPP");
+          if (typeof window !== "undefined") window.open("https://web.whatsapp.com", "_blank");
+          setTimeout(() => setTaskStatus("READY"), 1200);
           return;
-        } catch (proxyErr) {
-          console.warn('speak proxy failed, falling back to client TTS:', proxyErr);
         }
 
-        // Fallback: use browser Web Speech API if available
-        try {
-          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-            const utter = new SpeechSynthesisUtterance(textToSpeak);
-            utter.lang = 'en-US';
-            utter.onend = () => setTaskStatus('READY');
-            utter.onerror = (e) => {
-              console.error('speechSynthesis error', e);
-              setTaskStatus('SPEECH ERROR');
-            };
-            window.speechSynthesis.speak(utter);
-            return;
-          }
-        } catch (ttsErr) {
-          console.error('Web Speech API error:', ttsErr);
+        if (taskType === "speech") {
+          const textToSpeak = payloadText ?? "M.H.Z.A.L.Y. intelligence online. Systems fully operational.";
+          await speakText(textToSpeak);
+          return;
         }
+      } catch (e) {
+        console.error(e);
+        setTaskStatus("ERROR");
+      }
+    },
+    [speakText]
+  );
 
-        // If we reach here, no fallback available
-        setTaskStatus('SPEECH UNAVAILABLE');
+  // Speech recognition setup (client-side)
+  const startListening = useCallback(() => {
+    const Rec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!Rec) {
+      setTaskStatus('VOICE RECOGNITION UNAVAILABLE');
+      return;
+    }
+
+    try {
+      const recog = new Rec();
+      recog.lang = 'en-US';
+      recog.interimResults = false;
+      recog.maxAlternatives = 1;
+
+      recog.onstart = () => {
+        setListening(true);
+        setTaskStatus('LISTENING');
+      };
+
+      recog.onresult = (ev: any) => {
+        const transcript = Array.from(ev.results)
+          .map((r: any) => r[0].transcript)
+          .join(' ')
+          .trim();
+        setLastTranscript(transcript);
+        setTaskStatus(`RECOGNIZED: ${transcript}`);
+
+        // Simple command parsing
+        const cmd = transcript.toLowerCase();
+
+        if (cmd.includes('open whatsapp')) {
+          executeMhzalyTask('whatsapp');
+        } else if (cmd.includes('open youtube')) {
+          if (typeof window !== 'undefined') window.open('https://www.youtube.com', '_blank');
+        } else if (cmd.startsWith('search for ') || cmd.startsWith('search ')) {
+          const q = cmd.replace(/^search( for)?\s+/, '');
+          const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+          if (typeof window !== 'undefined') window.open(url, '_blank');
+        } else if (cmd.startsWith('speak ') || cmd.startsWith('say ')) {
+          const speakPhrase = cmd.replace(/^(speak|say)\s+/, '');
+          executeMhzalyTask('speech', speakPhrase);
+        } else {
+          // If no explicit command, treat as a speak request
+          executeMhzalyTask('speech', transcript);
+        }
+      };
+
+      recog.onerror = (e: any) => {
+        console.error('recognition error', e);
+        setTaskStatus('VOICE ERROR');
+      };
+
+      recog.onend = () => {
+        setListening(false);
+        // keep last transcript visible in status for a short time
+        setTimeout(() => setTaskStatus('READY'), 2000);
+      };
+
+      recog.start();
+
+      // store the recognition instance on window so we can stop it
+      (window as any).__mhzaly_recog = recog;
+    } catch (err) {
+      console.error('startListening failed', err);
+      setTaskStatus('VOICE ERROR');
+    }
+  }, [executeMhzalyTask]);
+
+  const stopListening = useCallback(() => {
+    const recog = (window as any).__mhzaly_recog;
+    try {
+      if (recog) {
+        recog.onend = null;
+        recog.stop();
       }
     } catch (e) {
-      console.error(e);
-      setTaskStatus("ERROR");
+      // ignore
     }
+    setListening(false);
+    setTaskStatus('READY');
   }, []);
 
   const stopGestures = useCallback(() => {
@@ -239,7 +328,8 @@ export default function MhzalyOrb() {
             {camera === "starting" ? "INITIALIZING…" : cameraOn ? "GESTURES ON" : "GESTURES OFF"}
           </button>
         </div>
-        <div className="hud-row">
+
+        <div className="hud-row" style={{ marginTop: 8 }}>
           <button type="button" className="hud-btn" onClick={() => sceneRef.current?.zoomIn()} aria-label="Zoom in">
             +
           </button>
@@ -249,8 +339,21 @@ export default function MhzalyOrb() {
           <button type="button" className="hud-btn" onClick={() => sceneRef.current?.resetView()}>
             RESET
           </button>
+
+          {/* Voice listen controls */}
+          <div style={{ display: 'inline-block', marginLeft: 12 }}>
+            <button
+              type="button"
+              className="hud-btn"
+              onClick={() => (listening ? stopListening() : startListening())}
+              aria-pressed={listening}
+            >
+              {listening ? 'STOP LISTENING' : 'LISTEN'}
+            </button>
+            {lastTranscript && <div style={{ color: '#80e5ff', marginTop: 6 }}>{lastTranscript}</div>}
+          </div>
         </div>
       </div>
     </>
   );
-} 
+}
