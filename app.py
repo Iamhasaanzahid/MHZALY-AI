@@ -3,6 +3,7 @@ import time
 import os
 import threading
 import logging
+import queue
 
 from automation import EnterpriseAutomationEngine
 # Safe import for voice engine so the UI doesn't crash if module is missing
@@ -79,31 +80,41 @@ with col3:
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
 
-    def do_listen_and_handle():
-        st.session_state["listening"] = True
+    # Thread-safe queue for worker -> main thread communication
+    _listener_queue = queue.Queue()
+
+    def _worker_listen():
         try:
-            # If voice engine is not available, set a clear result and avoid raising
+            # If voice engine is not available, enqueue a clear result and avoid raising
             if voice_engine is None:
-                st.session_state["last_recognized"] = None
-                st.session_state["last_result"] = "Voice engine unavailable."
+                _listener_queue.put({"recognized": None, "result": "Voice engine unavailable."})
                 return
 
             txt = voice_engine.listen_user()
             if txt:
-                st.session_state["last_recognized"] = txt
                 res = automation.handle_command(txt)
-                st.session_state["last_result"] = res
+                _listener_queue.put({"recognized": txt, "result": res})
             else:
-                st.session_state["last_recognized"] = None
-                st.session_state["last_result"] = "No speech recognized."
+                _listener_queue.put({"recognized": None, "result": "No speech recognized."})
         except Exception as e:
-            st.session_state["last_result"] = f"Listening error: {e}"
-        finally:
-            st.session_state["listening"] = False
+            _listener_queue.put({"recognized": None, "result": f"Listening error: {e}"})
 
+    # Start background worker (it will NOT touch st.session_state directly)
     if st.button("🎤 Click to Speak") and not st.session_state["listening"]:
-        threading.Thread(target=do_listen_and_handle, daemon=True).start()
+        st.session_state["listening"] = True
+        threading.Thread(target=_worker_listen, daemon=True).start()
         st.info("Listening in background...")
+
+    # Poll the queue on each rerun and update session_state from the main thread
+    try:
+        if not _listener_queue.empty():
+            _item = _listener_queue.get_nowait()
+            st.session_state["last_recognized"] = _item.get("recognized")
+            st.session_state["last_result"] = _item.get("result")
+            st.session_state["listening"] = False
+    except Exception:
+        # non-fatal: if queue operations fail for any reason, ensure listening flag is reset
+        st.session_state["listening"] = False
 
     if st.session_state["last_recognized"]:
         st.success(f"Recognized: {st.session_state['last_recognized']}")
