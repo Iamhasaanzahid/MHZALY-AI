@@ -27,6 +27,8 @@ export default function MhzalyOrb() {
   // Voice recognition UI state
   const [listening, setListening] = useState<boolean>(false);
   const [lastTranscript, setLastTranscript] = useState<string | null>(null);
+  const [linkFallback, setLinkFallback] = useState<string | null>(null);
+  const [continuous, setContinuous] = useState<boolean>(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -85,7 +87,14 @@ export default function MhzalyOrb() {
       try {
         if (taskType === "whatsapp") {
           setTaskStatus("OPENING WHATSAPP");
-          if (typeof window !== "undefined") window.open("https://web.whatsapp.com", "_blank");
+          if (typeof window !== "undefined") {
+            const win = window.open("https://web.whatsapp.com", "_blank");
+            if (!win) {
+              // popup blocked — provide fallback link
+              setLinkFallback('https://web.whatsapp.com');
+              setTaskStatus('POPUP BLOCKED');
+            }
+          }
           setTimeout(() => setTaskStatus("READY"), 1200);
           return;
         }
@@ -107,6 +116,7 @@ export default function MhzalyOrb() {
   const startListening = useCallback(() => {
     const Rec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!Rec) {
+      console.debug('SpeechRecognition not available');
       setTaskStatus('VOICE RECOGNITION UNAVAILABLE');
       return;
     }
@@ -116,13 +126,16 @@ export default function MhzalyOrb() {
       recog.lang = 'en-US';
       recog.interimResults = false;
       recog.maxAlternatives = 1;
+      recog.continuous = continuous;
 
       recog.onstart = () => {
+        console.debug('recognition onstart');
         setListening(true);
         setTaskStatus('LISTENING');
       };
 
       recog.onresult = (ev: any) => {
+        console.debug('recognition onresult', ev);
         const transcript = Array.from(ev.results)
           .map((r: any) => r[0].transcript)
           .join(' ')
@@ -134,13 +147,25 @@ export default function MhzalyOrb() {
         const cmd = transcript.toLowerCase();
 
         if (cmd.includes('open whatsapp')) {
-          executeMhzalyTask('whatsapp');
+          const win = typeof window !== 'undefined' ? window.open('https://web.whatsapp.com', '_blank') : null;
+          if (!win) {
+            setLinkFallback('https://web.whatsapp.com');
+            setTaskStatus('POPUP BLOCKED');
+          }
         } else if (cmd.includes('open youtube')) {
-          if (typeof window !== 'undefined') window.open('https://www.youtube.com', '_blank');
+          const win = typeof window !== 'undefined' ? window.open('https://www.youtube.com', '_blank') : null;
+          if (!win) {
+            setLinkFallback('https://www.youtube.com');
+            setTaskStatus('POPUP BLOCKED');
+          }
         } else if (cmd.startsWith('search for ') || cmd.startsWith('search ')) {
           const q = cmd.replace(/^search( for)?\s+/, '');
           const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
-          if (typeof window !== 'undefined') window.open(url, '_blank');
+          const win = typeof window !== 'undefined' ? window.open(url, '_blank') : null;
+          if (!win) {
+            setLinkFallback(url);
+            setTaskStatus('POPUP BLOCKED');
+          }
         } else if (cmd.startsWith('speak ') || cmd.startsWith('say ')) {
           const speakPhrase = cmd.replace(/^(speak|say)\s+/, '');
           executeMhzalyTask('speech', speakPhrase);
@@ -156,9 +181,15 @@ export default function MhzalyOrb() {
       };
 
       recog.onend = () => {
+        console.debug('recognition onend');
         setListening(false);
-        // keep last transcript visible in status for a short time
-        setTimeout(() => setTaskStatus('READY'), 2000);
+        // If continuous mode is enabled, restart recognition automatically
+        if (continuous) {
+          console.debug('restarting recognition due to continuous mode');
+          setTimeout(() => startListening(), 200);
+        } else {
+          setTimeout(() => setTaskStatus('READY'), 2000);
+        }
       };
 
       recog.start();
@@ -169,7 +200,7 @@ export default function MhzalyOrb() {
       console.error('startListening failed', err);
       setTaskStatus('VOICE ERROR');
     }
-  }, [executeMhzalyTask]);
+  }, [executeMhzalyTask, continuous]);
 
   const stopListening = useCallback(() => {
     const recog = (window as any).__mhzaly_recog;
@@ -350,7 +381,16 @@ export default function MhzalyOrb() {
             >
               {listening ? 'STOP LISTENING' : 'LISTEN'}
             </button>
+            <label style={{ marginLeft: 8, fontSize: 12 }}>
+              <input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} /> continuous
+            </label>
             {lastTranscript && <div style={{ color: '#80e5ff', marginTop: 6 }}>{lastTranscript}</div>}
+            {linkFallback && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ color: '#ffcc66' }}>Popup was blocked — click link:</div>
+                <a href={linkFallback} target="_blank" rel="noreferrer" className="hud-btn" style={{ display: 'inline-block', marginTop: 6 }}>{linkFallback}</a>
+              </div>
+            )}
           </div>
         </div>
       </div>
