@@ -37,18 +37,39 @@ export default function MhzalyOrb() {
     };
   }, []);
 
-  } else if (taskType === 'speech') {
-    setTaskStatus("AUDIO SYNTHESIS ACTIVE");
-    fetch('http://localhost:5000/speak', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ 
-            text: "M.H.Z.A.L.Y. intelligence online. Systems fully operational." 
-        }),
-    });
-}
+  // Handle tasks invoked from the HUD buttons
+  const executeMhzalyTask = useCallback(async (taskType: "whatsapp" | "speech") => {
+    try {
+      if (taskType === "whatsapp") {
+        setTaskStatus("OPENING WHATSAPP");
+        // Open WhatsApp Web in a new tab
+        if (typeof window !== "undefined") window.open("https://web.whatsapp.com", "_blank");
+        // return to READY after a short delay
+        setTimeout(() => setTaskStatus("READY"), 1200);
+      } else if (taskType === "speech") {
+        setTaskStatus("AUDIO SYNTHESIS ACTIVE");
+        try {
+          await fetch("http://localhost:5000/speak", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              text: "M.H.Z.A.L.Y. intelligence online. Systems fully operational.",
+            }),
+          });
+          setTaskStatus("READY");
+        } catch (fetchErr) {
+          console.error("speak request failed", fetchErr);
+          setTaskStatus("SPEECH ERROR");
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      setTaskStatus("ERROR");
+    }
+  }, []);
+
   const stopGestures = useCallback(() => {
     trackerRef.current?.stop();
     trackerRef.current = null;
