@@ -43,6 +43,30 @@ export default function MhzalyOrb() {
     };
   }, []);
 
+  // Play binary audio (ArrayBuffer) in browser
+  const playAudioBuffer = useCallback(async (buffer: ArrayBuffer, contentType: string) => {
+    try {
+      // Use blob URL for simple playback for common audio types (wav/mp3/ogg)
+      const blob = new Blob([buffer], { type: contentType });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio();
+      audio.src = url;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        setTaskStatus('READY');
+      };
+      audio.onerror = (e) => {
+        console.error('audio playback error', e);
+        URL.revokeObjectURL(url);
+        setTaskStatus('SPEECH ERROR');
+      };
+      await audio.play();
+    } catch (e) {
+      console.error('playAudioBuffer failed', e);
+      setTaskStatus('SPEECH ERROR');
+    }
+  }, []);
+
   // Speak helper that uses /api/speak proxy then falls back to Web Speech
   const speakText = useCallback(async (text: string) => {
     setTaskStatus("AUDIO SYNTHESIS ACTIVE");
@@ -55,6 +79,15 @@ export default function MhzalyOrb() {
 
       if (!res.ok) throw new Error(`speak proxy failed ${res.status}`);
 
+      const contentType = res.headers.get('content-type') || '';
+
+      if (contentType.startsWith('audio/')) {
+        const buf = await res.arrayBuffer();
+        await playAudioBuffer(buf, contentType);
+        return;
+      }
+
+      // otherwise assume json/text and just mark ready
       setTaskStatus('READY');
       return;
     } catch (proxyErr) {
@@ -79,7 +112,7 @@ export default function MhzalyOrb() {
     }
 
     setTaskStatus('SPEECH UNAVAILABLE');
-  }, []);
+  }, [playAudioBuffer]);
 
   // Handle tasks invoked from the HUD buttons or voice commands
   const executeMhzalyTask = useCallback(
@@ -143,7 +176,7 @@ export default function MhzalyOrb() {
         setLastTranscript(transcript);
         setTaskStatus(`RECOGNIZED: ${transcript}`);
 
-        // Simple command parsing
+        // Simple command parsing (extended)
         const cmd = transcript.toLowerCase();
 
         if (cmd.includes('open whatsapp')) {
@@ -158,6 +191,12 @@ export default function MhzalyOrb() {
             setLinkFallback('https://www.youtube.com');
             setTaskStatus('POPUP BLOCKED');
           }
+        } else if (cmd.includes('open gmail') || cmd.includes('open email')) {
+          const win = typeof window !== 'undefined' ? window.open('https://mail.google.com', '_blank') : null;
+          if (!win) setLinkFallback('https://mail.google.com');
+        } else if (cmd.includes('open github')) {
+          const win = typeof window !== 'undefined' ? window.open('https://github.com', '_blank') : null;
+          if (!win) setLinkFallback('https://github.com');
         } else if (cmd.startsWith('search for ') || cmd.startsWith('search ')) {
           const q = cmd.replace(/^search( for)?\s+/, '');
           const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
@@ -169,6 +208,12 @@ export default function MhzalyOrb() {
         } else if (cmd.startsWith('speak ') || cmd.startsWith('say ')) {
           const speakPhrase = cmd.replace(/^(speak|say)\s+/, '');
           executeMhzalyTask('speech', speakPhrase);
+        } else if (cmd.includes('what time') || cmd.includes("what's the time") || cmd.includes('tell time')) {
+          const now = new Date();
+          const timeStr = now.toLocaleTimeString();
+          executeMhzalyTask('speech', `The time is ${timeStr}`);
+        } else if (cmd.includes('stop listening') || cmd.includes('stop')) {
+          stopListening();
         } else {
           // If no explicit command, treat as a speak request
           executeMhzalyTask('speech', transcript);

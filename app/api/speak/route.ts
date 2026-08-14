@@ -13,10 +13,22 @@ export async function POST(req: Request) {
       body: JSON.stringify(body),
     });
 
-    const contentType = res.headers.get('content-type') || 'text/plain';
-    const text = await res.text();
+    const contentType = res.headers.get('content-type') || 'application/octet-stream';
 
-    return new NextResponse(text, {
+    // If backend returned audio, forward the binary body
+    if (contentType.startsWith('audio/')) {
+      const buffer = await res.arrayBuffer();
+      return new NextResponse(buffer, {
+        status: res.status,
+        headers: { 'Content-Type': contentType },
+      });
+    }
+
+    // Otherwise treat as text/json
+    const text = await res.text();
+    const isJson = contentType.includes('application/json');
+
+    return new NextResponse(isJson ? text : text, {
       status: res.status,
       headers: { 'Content-Type': contentType },
     });
