@@ -1,0 +1,20 @@
+# Local Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+
+# Editor
+.vscode/
+.DS_Store
+
+# Audit and secrets
+execution_audit.jsonl
+.env
+.env.*
