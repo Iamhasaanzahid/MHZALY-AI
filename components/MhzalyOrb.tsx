@@ -46,23 +46,49 @@ export default function MhzalyOrb() {
         if (typeof window !== "undefined") window.open("https://web.whatsapp.com", "_blank");
         // return to READY after a short delay
         setTimeout(() => setTaskStatus("READY"), 1200);
-      } else if (taskType === "speech") {
+        return;
+      }
+
+      if (taskType === "speech") {
+        const textToSpeak = "M.H.Z.A.L.Y. intelligence online. Systems fully operational.";
         setTaskStatus("AUDIO SYNTHESIS ACTIVE");
+
+        // First try server-backed speak proxy (avoids CORS/mixed-content issues)
         try {
-          await fetch("http://localhost:5000/speak", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              text: "M.H.Z.A.L.Y. intelligence online. Systems fully operational.",
-            }),
+          const res = await fetch('/api/speak', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: textToSpeak }),
           });
-          setTaskStatus("READY");
-        } catch (fetchErr) {
-          console.error("speak request failed", fetchErr);
-          setTaskStatus("SPEECH ERROR");
+
+          if (!res.ok) throw new Error(`speak proxy failed: ${res.status}`);
+
+          // If backend returns audio or text, we consider it successful.
+          setTaskStatus('READY');
+          return;
+        } catch (proxyErr) {
+          console.warn('speak proxy failed, falling back to client TTS:', proxyErr);
         }
+
+        // Fallback: use browser Web Speech API if available
+        try {
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            const utter = new SpeechSynthesisUtterance(textToSpeak);
+            utter.lang = 'en-US';
+            utter.onend = () => setTaskStatus('READY');
+            utter.onerror = (e) => {
+              console.error('speechSynthesis error', e);
+              setTaskStatus('SPEECH ERROR');
+            };
+            window.speechSynthesis.speak(utter);
+            return;
+          }
+        } catch (ttsErr) {
+          console.error('Web Speech API error:', ttsErr);
+        }
+
+        // If we reach here, no fallback available
+        setTaskStatus('SPEECH UNAVAILABLE');
       }
     } catch (e) {
       console.error(e);
