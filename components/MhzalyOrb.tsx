@@ -118,14 +118,31 @@ export default function MhzalyOrb() {
   const executeMhzalyTask = useCallback(
     async (taskType: "whatsapp" | "speech", payloadText?: string) => {
       try {
+        // ensure control window exists so navigation won't be blocked
+        let controlWin: Window | null = (window as any).__mhzaly_controlWin || null;
+        if (typeof window !== 'undefined' && !controlWin) {
+          try {
+            controlWin = window.open('about:blank', 'mhzaly_control');
+            if (controlWin) (window as any).__mhzaly_controlWin = controlWin;
+          } catch (e) {
+            controlWin = null;
+          }
+        }
+
         if (taskType === "whatsapp") {
           setTaskStatus("OPENING WHATSAPP");
-          if (typeof window !== "undefined") {
-            const win = window.open("https://web.whatsapp.com", "_blank");
+          const url = 'https://web.whatsapp.com';
+          if (controlWin) {
+            controlWin.location.href = url;
+            controlWin.focus();
+            await speakText('Yes sir. I opened WhatsApp Web.');
+          } else {
+            const win = window.open(url, '_blank');
             if (!win) {
-              // popup blocked — provide fallback link
-              setLinkFallback('https://web.whatsapp.com');
+              setLinkFallback(url);
               setTaskStatus('POPUP BLOCKED');
+            } else {
+              await speakText('Yes sir. I opened WhatsApp Web.');
             }
           }
           setTimeout(() => setTaskStatus("READY"), 1200);
@@ -155,6 +172,21 @@ export default function MhzalyOrb() {
     }
 
     try {
+      // open a control window on the user gesture so later navigation isn't blocked
+      try {
+        if (typeof window !== 'undefined' && !(window as any).__mhzaly_controlWin) {
+          const cw = window.open('about:blank', 'mhzaly_control');
+          if (cw) (window as any).__mhzaly_controlWin = cw;
+          else {
+            // popup blocked at gesture time — set fallback so user can click manually
+            setLinkFallback('about:blank');
+            setTaskStatus('POPUP BLOCKED');
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
       const recog = new Rec();
       recog.lang = 'en-US';
       recog.interimResults = false;
@@ -179,45 +211,83 @@ export default function MhzalyOrb() {
         // Simple command parsing (extended)
         const cmd = transcript.toLowerCase();
 
-        if (cmd.includes('open whatsapp')) {
-          const win = typeof window !== 'undefined' ? window.open('https://web.whatsapp.com', '_blank') : null;
-          if (!win) {
-            setLinkFallback('https://web.whatsapp.com');
-            setTaskStatus('POPUP BLOCKED');
+        // prefer control window navigation to avoid popup blockers
+        const controlWin: Window | null = (window as any).__mhzaly_controlWin || null;
+
+        const navigateOrOpen = async (url: string, confirmation: string) => {
+          if (controlWin) {
+            try {
+              controlWin.location.href = url;
+              controlWin.focus();
+              await speakText(confirmation);
+            } catch (err) {
+              console.warn('control window navigation failed', err);
+              const w = window.open(url, '_blank');
+              if (!w) {
+                setLinkFallback(url);
+                setTaskStatus('POPUP BLOCKED');
+              } else {
+                await speakText(confirmation);
+              }
+            }
+          } else {
+            const w = window.open(url, '_blank');
+            if (!w) {
+              setLinkFallback(url);
+              setTaskStatus('POPUP BLOCKED');
+            } else {
+              (window as any).__mhzaly_controlWin = w;
+              await speakText(confirmation);
+            }
           }
-        } else if (cmd.includes('open youtube')) {
-          const win = typeof window !== 'undefined' ? window.open('https://www.youtube.com', '_blank') : null;
-          if (!win) {
-            setLinkFallback('https://www.youtube.com');
-            setTaskStatus('POPUP BLOCKED');
+        };
+
+        (async () => {
+          if (cmd.includes('open whatsapp')) {
+            await navigateOrOpen('https://web.whatsapp.com', 'Yes sir. I opened WhatsApp Web.');
+          } else if (cmd.includes('call ')) {
+            const target = cmd.replace(/^.*call\s+/, '').trim();
+            const digits = target.replace(/\D/g, '');
+            if (digits.length >= 6) {
+              const url = `https://wa.me/${digits}`;
+              await navigateOrOpen(url, `Yes sir. Opening WhatsApp call link for ${target}.`);
+            } else {
+              // open WhatsApp web and search for contact name
+              const url = `https://web.whatsapp.com`;
+              await navigateOrOpen(url, `Yes sir. I opened WhatsApp. Please choose the contact ${target} to call.`);
+            }
+          } else if (cmd.includes('open youtube')) {
+            // support "open youtube and search for cats"
+            const match = cmd.match(/search (for )?(.+)$/);
+            if (match && match[2]) {
+              const q = match[2].trim();
+              const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
+              await navigateOrOpen(url, `Yes sir. I opened YouTube and searched for ${q}.`);
+            } else {
+              await navigateOrOpen('https://www.youtube.com', 'Yes sir. I opened YouTube.');
+            }
+          } else if (cmd.includes('open gmail') || cmd.includes('open email')) {
+            await navigateOrOpen('https://mail.google.com', 'Yes sir. I opened Gmail.');
+          } else if (cmd.includes('open github')) {
+            await navigateOrOpen('https://github.com', 'Yes sir. I opened GitHub.');
+          } else if (cmd.startsWith('search for ') || cmd.startsWith('search ')) {
+            const q = cmd.replace(/^search( for)?\s+/, '');
+            const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+            await navigateOrOpen(url, `Yes sir. I searched Google for ${q}.`);
+          } else if (cmd.startsWith('speak ') || cmd.startsWith('say ')) {
+            const speakPhrase = cmd.replace(/^(speak|say)\s+/, '');
+            executeMhzalyTask('speech', speakPhrase);
+          } else if (cmd.includes('what time') || cmd.includes("what's the time") || cmd.includes('tell time')) {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            executeMhzalyTask('speech', `The time is ${timeStr}`);
+          } else if (cmd.includes('stop listening') || cmd.includes('stop')) {
+            stopListening();
+          } else {
+            // If no explicit command, treat as a speak request
+            executeMhzalyTask('speech', transcript);
           }
-        } else if (cmd.includes('open gmail') || cmd.includes('open email')) {
-          const win = typeof window !== 'undefined' ? window.open('https://mail.google.com', '_blank') : null;
-          if (!win) setLinkFallback('https://mail.google.com');
-        } else if (cmd.includes('open github')) {
-          const win = typeof window !== 'undefined' ? window.open('https://github.com', '_blank') : null;
-          if (!win) setLinkFallback('https://github.com');
-        } else if (cmd.startsWith('search for ') || cmd.startsWith('search ')) {
-          const q = cmd.replace(/^search( for)?\s+/, '');
-          const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
-          const win = typeof window !== 'undefined' ? window.open(url, '_blank') : null;
-          if (!win) {
-            setLinkFallback(url);
-            setTaskStatus('POPUP BLOCKED');
-          }
-        } else if (cmd.startsWith('speak ') || cmd.startsWith('say ')) {
-          const speakPhrase = cmd.replace(/^(speak|say)\s+/, '');
-          executeMhzalyTask('speech', speakPhrase);
-        } else if (cmd.includes('what time') || cmd.includes("what's the time") || cmd.includes('tell time')) {
-          const now = new Date();
-          const timeStr = now.toLocaleTimeString();
-          executeMhzalyTask('speech', `The time is ${timeStr}`);
-        } else if (cmd.includes('stop listening') || cmd.includes('stop')) {
-          stopListening();
-        } else {
-          // If no explicit command, treat as a speak request
-          executeMhzalyTask('speech', transcript);
-        }
+        })();
       };
 
       recog.onerror = (e: any) => {
@@ -245,7 +315,7 @@ export default function MhzalyOrb() {
       console.error('startListening failed', err);
       setTaskStatus('VOICE ERROR');
     }
-  }, [executeMhzalyTask, continuous]);
+  }, [executeMhzalyTask, continuous, speakText]);
 
   const stopListening = useCallback(() => {
     const recog = (window as any).__mhzaly_recog;
